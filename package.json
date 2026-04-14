@@ -1,0 +1,13 @@
+{
+  "name": "roller-pdf-worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node worker.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.8",
+    "dotenv": "^16.4.7",
+    "playwright": "^1.52.0"
+  }
+}
