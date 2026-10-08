@@ -14,6 +14,8 @@ const {
   KEEP_BROWSER_OPEN_ON_FAIL = 'false',
   RETRY_ALERT_THRESHOLD = '5',
   STALE_QUEUE_MINUTES = '30',
+  DEBUG_SCREENSHOTS = 'false',
+  ROW_TIMEOUT_MINUTES = '6',
 } = process.env;
 
 if (!ROLLER_EMAIL || !ROLLER_PASSWORD || !SUPABASE_URL || !SUPABASE_SECRET_KEY) {
@@ -28,6 +30,90 @@ const KEEP_BROWSER_OPEN_ON_FAIL_BOOL =
 const POLL_MS = Number(POLL_INTERVAL_MS) || 60000;
 const ALERT_THRESHOLD = Number(RETRY_ALERT_THRESHOLD) || 5;
 const STALE_QUEUE_MS = (Number(STALE_QUEUE_MINUTES) || 30) * 60 * 1000;
+const DEBUG_SCREENSHOTS_BOOL = String(DEBUG_SCREENSHOTS).toLowerCase() === 'true';
+const ROW_TIMEOUT_MS = (Number(ROW_TIMEOUT_MINUTES) || 6) * 60 * 1000;
+
+// v2 (8 Oct 2026): keep Chromium inside the 512 MB Render plan.
+// One renderer process for all frames, no /dev/shm, no GPU, no extras.
+const CHROMIUM_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-gpu',
+  '--no-zygote',
+  '--disable-extensions',
+  '--disable-background-networking',
+  '--disable-component-update',
+  '--disable-default-apps',
+  '--disable-sync',
+  '--mute-audio',
+  '--no-first-run',
+  '--disable-site-isolation-trials',
+  '--disable-features=site-per-process,IsolateOrigins,Translate,MediaRouter,OptimizationHints',
+  '--renderer-process-limit=1',
+  '--js-flags=--max-old-space-size=256',
+];
+
+// Third-party widgets on the Roller back office that the worker never needs.
+const BLOCKED_HOST_PATTERNS = [
+  /(^|\.)announcekit\.app$/i,
+  /(^|\.)my\.site\.com$/i,
+  /(^|\.)salesforce\.com$/i,
+  /(^|\.)salesforceliveagent\.com$/i,
+  /(^|\.)force\.com$/i,
+  /(^|\.)google-analytics\.com$/i,
+  /(^|\.)googletagmanager\.com$/i,
+  /(^|\.)doubleclick\.net$/i,
+  /(^|\.)hotjar\.com$/i,
+  /(^|\.)intercom\.io$/i,
+  /(^|\.)intercomcdn\.com$/i,
+  /(^|\.)segment\.(io|com)$/i,
+  /(^|\.)fullstory\.com$/i,
+  /(^|\.)pendo\.io$/i,
+  /(^|\.)clarity\.ms$/i,
+  /(^|\.)facebook\.(net|com)$/i,
+  /(^|\.)nr-data\.net$/i,
+  /(^|\.)newrelic\.com$/i,
+  /(^|\.)datadoghq\.(com|eu)$/i,
+  /(^|\.)sentry\.io$/i,
+  /(^|\.)launchdarkly\.com$/i,
+  /(^|\.)zdassets\.com$/i,
+  /(^|\.)zendesk\.com$/i,
+];
+const BLOCKED_RESOURCE_TYPES = new Set(['image', 'media', 'font']);
+
+function isBlockedRequest(request) {
+  try {
+    if (BLOCKED_RESOURCE_TYPES.has(request.resourceType())) return true;
+    const host = new URL(request.url()).hostname;
+    return BLOCKED_HOST_PATTERNS.some((re) => re.test(host));
+  } catch {
+    return false;
+  }
+}
+
+function isRollerFrameUrl(url) {
+  try {
+    const host = new URL(url).hostname;
+    return /(^|\.)roller\.app$/i.test(host);
+  } catch {
+    return false;
+  }
+}
+
+function isRollerLoginUrl(url) {
+  return /\/u\/login|\/login|my\.roller\.app\/u\//i.test(url || '');
+}
+
+async function debugShot(page, path) {
+  if (!DEBUG_SCREENSHOTS_BOOL) return;
+  await page.screenshot({ path, fullPage: false }).catch(() => {});
+}
+
+function memMb() {
+  const m = process.memoryUsage();
+  return `node rss ${Math.round(m.rss / 1048576)} MB`;
+}
 
 const MONTHS = {
   january: '01',
@@ -264,10 +350,6 @@ async function createFailureAlert(raw, err, retryCount) {
       payload: {
         external_signed_waiver_id: raw.external_signed_waiver_id,
         external_waiver_id: raw.external_waiver_id,
-        holder_first_name: raw.holder_first_name,
-        holder_last_name: raw.holder_last_name,
-        holder_date_of_birth: raw.holder_date_of_birth,
-        contact_email: raw.contact_email,
         download_status: raw.download_status,
         scrape_status: raw.scrape_status,
         retry_count: retryCount,
@@ -356,10 +438,26 @@ async function firstVisibleLocator(page, factories, timeout = 8000) {
   return null;
 }
 
+async function waitForRollerToSettle(page, timeoutMs = 25000) {
+  // The Roller back office first loads /waivers and only then sends a
+  // logged-out browser to the login page. Wait until one of the two is clear.
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    const url = page.url();
+    if (isRollerLoginUrl(url)) return 'login';
+    const legacyFrame = page.frames().find((f) => /\/legacy\/waivers/i.test(f.url()));
+    if (url.includes('manage.roller.app') && legacyFrame) return 'app';
+    await page.waitForTimeout(500);
+  }
+  return isRollerLoginUrl(page.url()) ? 'login' : 'unknown';
+}
+
 async function login(page) {
   await gotoWithRetry(page, `${ROLLER_BASE_URL}/waivers`, 3);
 
-  if (page.url().includes('manage.roller.app/waivers')) {
+  const state = await waitForRollerToSettle(page);
+  console.log(`Roller page state: ${state}`);
+  if (state === 'app') {
     return;
   }
 
@@ -372,7 +470,7 @@ async function login(page) {
   ], 10000);
 
   if (!emailInput) {
-    await page.screenshot({ path: 'debug-login-no-email.png', fullPage: true }).catch(() => {});
+    await debugShot(page, 'debug-login-no-email.png');
     throw new Error(`Could not find email input. Current URL: ${page.url()}`);
   }
 
@@ -398,7 +496,7 @@ async function login(page) {
 
     const submitBtn = await buttonLocator();
     if (!submitBtn) {
-      await page.screenshot({ path: 'debug-login-no-submit.png', fullPage: true }).catch(() => {});
+      await debugShot(page, 'debug-login-no-submit.png');
       throw new Error('Could not find submit button.');
     }
 
@@ -409,7 +507,7 @@ async function login(page) {
   } else {
     const continueBtn = await buttonLocator();
     if (!continueBtn) {
-      await page.screenshot({ path: 'debug-login-no-continue.png', fullPage: true }).catch(() => {});
+      await debugShot(page, 'debug-login-no-continue.png');
       throw new Error('Could not find Continue button after email.');
     }
 
@@ -425,7 +523,7 @@ async function login(page) {
     ], 10000);
 
     if (!passwordInput) {
-      await page.screenshot({ path: 'debug-login-no-password.png', fullPage: true }).catch(() => {});
+      await debugShot(page, 'debug-login-no-password.png');
       throw new Error(`Could not find password input after Continue. Current URL: ${page.url()}`);
     }
 
@@ -433,7 +531,7 @@ async function login(page) {
 
     const submitBtn = await buttonLocator();
     if (!submitBtn) {
-      await page.screenshot({ path: 'debug-login-no-final-submit.png', fullPage: true }).catch(() => {});
+      await debugShot(page, 'debug-login-no-final-submit.png');
       throw new Error('Could not find final submit button.');
     }
 
@@ -445,10 +543,11 @@ async function login(page) {
 
   await page.waitForTimeout(3000);
 
-  if (!page.url().includes('manage.roller.app')) {
-    await page.screenshot({ path: 'debug-login-failed.png', fullPage: true }).catch(() => {});
-    throw new Error(`Login may have failed. Current URL after login: ${page.url()}`);
+  if (!page.url().includes('manage.roller.app') || isRollerLoginUrl(page.url())) {
+    await debugShot(page, 'debug-login-failed.png');
+    throw new Error('Login failed: still on the Roller login page after submitting.');
   }
+  console.log('Logged in to Roller.');
 }
 
 async function openWaiverHolders(page) {
@@ -457,19 +556,13 @@ async function openWaiverHolders(page) {
 }
 
 async function allFrames(page) {
-  return page.frames();
+  return page.frames().filter((f) => isRollerFrameUrl(f.url()));
 }
 
 async function findWaiverSearchInput(page) {
   const frames = await allFrames(page);
 
-  for (const frame of frames) {
-    try {
-      console.log('Checking frame:', frame.url());
-    } catch {
-      // ignore
-    }
-  }
+  console.log(`Roller frames on page: ${frames.length}`);
 
   for (const frame of frames) {
     const exact = await (async () => {
@@ -494,7 +587,7 @@ async function findWaiverSearchInput(page) {
     })();
 
     if (exact) {
-      console.log('Found exact search input in frame:', frame.url());
+      console.log('Found waiver search input.');
       return exact.locator;
     }
   }
@@ -549,8 +642,6 @@ async function findWaiverSearchInput(page) {
 
   if (best) {
     console.log('Best search candidate score:', best.score);
-    console.log('Best search candidate meta:', best.meta);
-    console.log('Best search candidate frame:', best.frame.url());
     return best.locator;
   }
 
@@ -561,7 +652,7 @@ async function searchWaivers(page, searchValue) {
   const searchInput = await findWaiverSearchInput(page);
 
   if (!searchInput) {
-    await page.screenshot({ path: 'debug-no-search-input.png', fullPage: true }).catch(() => {});
+    await debugShot(page, 'debug-no-search-input.png');
     throw new Error('Could not find waiver search input.');
   }
 
@@ -590,7 +681,7 @@ async function searchWaivers(page, searchValue) {
   await searchInput.press('Enter').catch(() => {});
   await page.waitForTimeout(2500);
 
-  await page.screenshot({ path: 'debug-after-search.png', fullPage: true }).catch(() => {});
+  await debugShot(page, 'debug-after-search.png');
 }
 
 async function findTableFrame(page) {
@@ -619,7 +710,7 @@ async function readVisibleTableRows(page) {
   const frame = await findTableFrame(page);
 
   if (!frame) {
-    await page.screenshot({ path: 'debug-no-table-frame.png', fullPage: true }).catch(() => {});
+    await debugShot(page, 'debug-no-table-frame.png');
     return [];
   }
 
@@ -710,17 +801,10 @@ function isExactCandidateMatch(candidate, raw) {
 async function chooseBestCandidate(page, raw) {
   const candidates = await readVisibleTableRows(page);
 
-  console.log('RAW TARGET:', {
-    external_signed_waiver_id: raw.external_signed_waiver_id,
-    external_waiver_id: raw.external_waiver_id,
-    holder_first_name: raw.holder_first_name,
-    holder_last_name: raw.holder_last_name,
-    holder_date_of_birth: raw.holder_date_of_birth,
-    signed_at_date_only: toIsoDateOnly(raw.signed_at),
-  });
+  console.log(`Target ${raw.external_signed_waiver_id} (waiver ${raw.external_waiver_id}); rows read: ${candidates.length}`);
 
   if (!candidates.length) {
-    await page.screenshot({ path: 'debug-no-candidates.png', fullPage: true }).catch(() => {});
+    await debugShot(page, 'debug-no-candidates.png');
     return null;
   }
 
@@ -729,15 +813,13 @@ async function chooseBestCandidate(page, raw) {
   for (const candidate of candidates) {
     const check = isExactCandidateMatch(candidate, raw);
 
-    console.log('CANDIDATE CHECK:', {
-      nameText: candidate.nameText,
-      signedByText: candidate.signedByText,
-      firstName: candidate.firstName,
-      lastName: candidate.lastName,
-      dob: candidate.dob,
-      signedDate: candidate.signedDate,
+    console.log('Candidate check:', {
       waiverId: candidate.waiverId,
-      check,
+      first: check.firstNameMatch,
+      last: check.lastNameMatch,
+      dob: check.dobMatch,
+      waiver: check.waiverMatch,
+      signedDate: check.signedDateMatch,
     });
 
     if (check.exact) {
@@ -754,11 +836,11 @@ async function chooseBestCandidate(page, raw) {
   }
 
   if (exactMatches.length > 1) {
-    await page.screenshot({ path: 'debug-multiple-exact-matches.png', fullPage: true }).catch(() => {});
+    await debugShot(page, 'debug-multiple-exact-matches.png');
     throw new Error('Multiple exact waiver matches found. Manual review needed.');
   }
 
-  await page.screenshot({ path: 'debug-no-exact-match.png', fullPage: true }).catch(() => {});
+  await debugShot(page, 'debug-no-exact-match.png');
   return null;
 }
 
@@ -788,7 +870,7 @@ async function clickRowAndCapturePdf(context, candidate, raw) {
     if (popup) {
       await popup.waitForLoadState('domcontentloaded').catch(() => {});
       await popup.waitForTimeout(4000);
-      await popup.screenshot({ path: 'debug-pdf-popup.png', fullPage: true }).catch(() => {});
+      await debugShot(popup, 'debug-pdf-popup.png');
     } else {
       await candidate.row.page().waitForTimeout(4000);
     }
@@ -820,11 +902,25 @@ async function processRow(raw) {
 
   const browser = await chromium.launch({
     headless: HEADLESS_BOOL,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: CHROMIUM_ARGS,
   });
 
-  const context = await browser.newContext();
+  const context = await browser.newContext({
+    viewport: { width: 1280, height: 800 },
+    serviceWorkers: 'block',
+  });
+  await context.route('**/*', (route) => {
+    if (isBlockedRequest(route.request())) return route.abort();
+    return route.continue();
+  });
   const page = await context.newPage();
+
+  let timedOut = false;
+  const watchdog = setTimeout(() => {
+    timedOut = true;
+    console.error(`Row ${raw.external_signed_waiver_id} took longer than ${ROW_TIMEOUT_MS / 60000} minutes; closing the browser.`);
+    browser.close().catch(() => {});
+  }, ROW_TIMEOUT_MS);
 
   try {
     await login(page);
@@ -838,7 +934,7 @@ async function processRow(raw) {
       throw new Error('No email or holder name available for Roller search.');
     }
 
-    console.log(`Searching Roller for: ${searchValue}`);
+    console.log(`Searching Roller by ${raw.contact_email ? 'email' : 'name'} (${memMb()})`);
     await searchWaivers(page, searchValue);
 
     const candidate = await chooseBestCandidate(page, raw);
@@ -912,6 +1008,9 @@ async function processRow(raw) {
     const nextRetryCount = (raw.retry_count || 0) + 1;
     const shouldAlert = nextRetryCount >= ALERT_THRESHOLD && !raw.alert_sent;
 
+    if (timedOut) {
+      err = new Error(`Timed out after ${ROW_TIMEOUT_MS / 60000} minutes (${err.message})`);
+    }
     console.error(`Failed for ${raw.external_signed_waiver_id}:`, err.message);
 
     await updateRawRow(raw.external_signed_waiver_id, {
@@ -960,7 +1059,8 @@ async function processRow(raw) {
 
     throw err;
   } finally {
-    if (!KEEP_BROWSER_OPEN_ON_FAIL_BOOL) {
+    clearTimeout(watchdog);
+    if (!KEEP_BROWSER_OPEN_ON_FAIL_BOOL || timedOut) {
       await browser.close().catch(() => {});
     }
   }
@@ -1045,6 +1145,8 @@ async function loopQueue() {
     }
   }
 }
+
+console.log(`Roller PDF worker v2 started (row timeout ${ROW_TIMEOUT_MS / 60000} min, debug screenshots ${DEBUG_SCREENSHOTS_BOOL ? 'on' : 'off'}).`);
 
 loopQueue().catch((err) => {
   console.error(err);
