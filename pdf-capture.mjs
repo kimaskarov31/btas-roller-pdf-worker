@@ -57,11 +57,27 @@ export function urlShape(url) {
   }
 }
 
+// Memory in use by the container without the file cache the kernel can drop
+// ("working set", the number Render shows). memory.current alone stays near the
+// limit because it counts that cache too.
+const CGROUP_FILES = [
+  ['/sys/fs/cgroup/memory.current', '/sys/fs/cgroup/memory.stat', 'inactive_file'],
+  ['/sys/fs/cgroup/memory/memory.usage_in_bytes', '/sys/fs/cgroup/memory/memory.stat', 'total_inactive_file'],
+];
+
 function readCgroupBytes() {
-  for (const p of ['/sys/fs/cgroup/memory.current', '/sys/fs/cgroup/memory/memory.usage_in_bytes']) {
+  for (const [usageFile, statFile, cacheKey] of CGROUP_FILES) {
     try {
-      const v = Number(readFileSync(p, 'utf8').trim());
-      if (Number.isFinite(v) && v > 0) return v;
+      const usage = Number(readFileSync(usageFile, 'utf8').trim());
+      if (!Number.isFinite(usage) || usage <= 0) continue;
+      let cache = 0;
+      try {
+        const m = readFileSync(statFile, 'utf8').match(new RegExp(`^${cacheKey} (\\d+)$`, 'm'));
+        if (m) cache = Number(m[1]);
+      } catch {
+        cache = 0;
+      }
+      return Math.max(0, usage - cache);
     } catch {
       // not available here
     }
