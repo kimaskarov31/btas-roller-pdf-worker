@@ -57,27 +57,24 @@ export function urlShape(url) {
   }
 }
 
-// Memory in use by the container without the file cache the kernel can drop
-// ("working set", the number Render shows). memory.current alone stays near the
-// limit because it counts that cache too.
-const CGROUP_FILES = [
-  ['/sys/fs/cgroup/memory.current', '/sys/fs/cgroup/memory.stat', 'inactive_file'],
-  ['/sys/fs/cgroup/memory/memory.usage_in_bytes', '/sys/fs/cgroup/memory/memory.stat', 'total_inactive_file'],
+// Memory that cannot be given back while the worker runs: the processes' own
+// memory (anon) plus shared memory (shmem, where Chrome keeps its page
+// buffers). File cache is left out: the kernel drops it when memory is short,
+// so it is not what makes the container run out. Read from the container's
+// memory.stat (cgroup v2 names first, then v1).
+const CGROUP_STAT_FILES = [
+  ['/sys/fs/cgroup/memory.stat', 'anon', 'shmem'],
+  ['/sys/fs/cgroup/memory/memory.stat', 'total_rss', 'total_shmem'],
 ];
 
 function readCgroupBytes() {
-  for (const [usageFile, statFile, cacheKey] of CGROUP_FILES) {
+  for (const [statFile, anonKey, shmemKey] of CGROUP_STAT_FILES) {
     try {
-      const usage = Number(readFileSync(usageFile, 'utf8').trim());
-      if (!Number.isFinite(usage) || usage <= 0) continue;
-      let cache = 0;
-      try {
-        const m = readFileSync(statFile, 'utf8').match(new RegExp(`^${cacheKey} (\\d+)$`, 'm'));
-        if (m) cache = Number(m[1]);
-      } catch {
-        cache = 0;
-      }
-      return Math.max(0, usage - cache);
+      const text = readFileSync(statFile, 'utf8');
+      const anon = text.match(new RegExp(`^${anonKey} (\\d+)$`, 'm'));
+      if (!anon) continue;
+      const shmem = text.match(new RegExp(`^${shmemKey} (\\d+)$`, 'm'));
+      return Number(anon[1]) + (shmem ? Number(shmem[1]) : 0);
     } catch {
       // not available here
     }
@@ -103,18 +100,16 @@ function readProcRssBytes() {
   return total || null;
 }
 
-// The sum of what the worker's processes (Node and Chrome) hold in memory.
-// During a run the container counter climbs to the limit in both ways (Chrome's
-// shared memory and cache count there), so it cannot show the difference
-// between them; Render's own memory chart stays the reference.
+// The adding up of each process's memory counts shared pages many times, so
+// it is only the fallback.
 export function memorySource() {
+  if (readCgroupBytes()) return 'container anon+shmem';
   if (readProcRssBytes()) return 'processes';
-  if (readCgroupBytes()) return 'container';
   return 'node';
 }
 
 export function memoryNowMb() {
-  const bytes = readProcRssBytes() ?? readCgroupBytes() ?? process.memoryUsage().rss;
+  const bytes = readCgroupBytes() ?? readProcRssBytes() ?? process.memoryUsage().rss;
   return Math.round(bytes / 1048576);
 }
 
