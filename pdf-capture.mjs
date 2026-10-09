@@ -103,14 +103,18 @@ function readProcRssBytes() {
   return total || null;
 }
 
+// The sum of what the worker's processes (Node and Chrome) hold in memory.
+// During a run the container counter climbs to the limit in both ways (Chrome's
+// shared memory and cache count there), so it cannot show the difference
+// between them; Render's own memory chart stays the reference.
 export function memorySource() {
-  if (readCgroupBytes()) return 'container';
   if (readProcRssBytes()) return 'processes';
+  if (readCgroupBytes()) return 'container';
   return 'node';
 }
 
 export function memoryNowMb() {
-  const bytes = readCgroupBytes() ?? readProcRssBytes() ?? process.memoryUsage().rss;
+  const bytes = readProcRssBytes() ?? readCgroupBytes() ?? process.memoryUsage().rss;
   return Math.round(bytes / 1048576);
 }
 
