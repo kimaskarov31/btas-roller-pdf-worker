@@ -1,6 +1,15 @@
 import 'dotenv/config';
 import { chromium } from 'playwright';
 import { createClient } from '@supabase/supabase-js';
+import {
+  capturePdfDirect,
+  looksLikePdf,
+  hasPdfEnd,
+  pdfPageCount,
+  md5,
+  startMemorySampler,
+  memoryNowMb,
+} from './pdf-capture.mjs';
 
 const {
   ROLLER_EMAIL,
@@ -16,6 +25,9 @@ const {
   STALE_QUEUE_MINUTES = '30',
   DEBUG_SCREENSHOTS = 'false',
   ROW_TIMEOUT_MINUTES = '6',
+  PDF_CAPTURE_MODE = 'viewer',
+  DIRECT_CAPTURE_SECONDS = '30',
+  SETTINGS_CACHE_SECONDS = '60',
 } = process.env;
 
 if (!ROLLER_EMAIL || !ROLLER_PASSWORD || !SUPABASE_URL || !SUPABASE_SECRET_KEY) {
@@ -32,6 +44,19 @@ const ALERT_THRESHOLD = Number(RETRY_ALERT_THRESHOLD) || 5;
 const STALE_QUEUE_MS = (Number(STALE_QUEUE_MINUTES) || 30) * 60 * 1000;
 const DEBUG_SCREENSHOTS_BOOL = String(DEBUG_SCREENSHOTS).toLowerCase() === 'true';
 const ROW_TIMEOUT_MS = (Number(ROW_TIMEOUT_MINUTES) || 6) * 60 * 1000;
+const DIRECT_CAPTURE_MS = (Number(DIRECT_CAPTURE_SECONDS) || 30) * 1000;
+const SETTINGS_CACHE_MS = (Number(SETTINGS_CACHE_SECONDS) || 60) * 1000;
+
+// v3 (9 Oct 2026): two ways to get the PDF.
+// "direct": catch the PDF file as Roller sends it; the viewer never draws it.
+// "viewer": the v2 way (open Roller's viewer and keep the PDF it loads).
+// The way is read from the Supabase setting roller_pdf_capture_mode, so it can be
+// switched (and switched back) without a deploy. Without the setting:
+// PDF_CAPTURE_MODE, else "viewer". If "direct" finds no complete PDF, the same
+// row tries the viewer way at once.
+const CAPTURE_MODES = new Set(['direct', 'viewer']);
+const SETTING_CAPTURE_MODE = 'roller_pdf_capture_mode';
+const SETTING_SELF_TEST = 'roller_worker_self_test';
 
 // v2 (8 Oct 2026): keep Chromium inside the 512 MB Render plan.
 // One renderer process for all frames, no /dev/shm, no GPU, no extras.
@@ -111,8 +136,38 @@ async function debugShot(page, path) {
 }
 
 function memMb() {
-  const m = process.memoryUsage();
-  return `node rss ${Math.round(m.rss / 1048576)} MB`;
+  return `memory ${memoryNowMb()} MB`;
+}
+
+async function readSetting(key) {
+  const { data, error } = await supabase
+    .from('app_private_settings')
+    .select('value')
+    .eq('key', key)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? String(data.value || '').trim() : '';
+}
+
+let captureModeCache = { value: null, at: 0 };
+
+async function getCaptureMode() {
+  if (captureModeCache.value && Date.now() - captureModeCache.at < SETTINGS_CACHE_MS) {
+    return captureModeCache.value;
+  }
+  let mode = null;
+  try {
+    const v = (await readSetting(SETTING_CAPTURE_MODE)).toLowerCase();
+    if (CAPTURE_MODES.has(v)) mode = v;
+  } catch (err) {
+    console.warn('Could not read the PDF way setting:', err.message);
+  }
+  if (!mode) {
+    const envMode = String(PDF_CAPTURE_MODE).toLowerCase();
+    mode = CAPTURE_MODES.has(envMode) ? envMode : 'viewer';
+  }
+  captureModeCache = { value: mode, at: Date.now() };
+  return mode;
 }
 
 const MONTHS = {
@@ -844,14 +899,26 @@ async function chooseBestCandidate(page, raw) {
   return null;
 }
 
-async function clickRowAndCapturePdf(context, candidate, raw) {
+// The v2 way: open Roller's viewer and keep the PDF it loads.
+async function captureWithViewer(context, candidate) {
   let pdfBuffer = null;
+
+  // Keep the best PDF seen: a complete one before a part (a viewer may ask for
+  // the first bytes only), then the larger one.
+  const better = (a, b) => {
+    if (!b) return true;
+    const ca = hasPdfEnd(a);
+    const cb = hasPdfEnd(b);
+    if (ca !== cb) return ca;
+    return a.length > b.length;
+  };
 
   const responseHandler = async (response) => {
     try {
       const contentType = response.headers()['content-type'] || '';
       if (contentType.includes('application/pdf')) {
-        pdfBuffer = await response.body();
+        const body = await response.body();
+        if (looksLikePdf(body) && better(body, pdfBuffer)) pdfBuffer = body;
       }
     } catch {
       // ignore
@@ -874,31 +941,22 @@ async function clickRowAndCapturePdf(context, candidate, raw) {
     } else {
       await candidate.row.page().waitForTimeout(4000);
     }
-
-    if (pdfBuffer) {
-      await updateRawRow(raw.external_signed_waiver_id, {
-        scrape_status: 'pdf_discovered',
-      });
-    }
   } finally {
     context.off('response', responseHandler);
+    if (popup) await popup.close().catch(() => {});
   }
 
-  return { popup, pdfBuffer };
+  return {
+    pdfBuffer,
+    info: { method: 'viewer', found: !!pdfBuffer, popupOpened: !!popup, bytes: pdfBuffer ? pdfBuffer.length : 0 },
+  };
 }
 
-async function processRow(raw) {
-  console.log(`Processing signedWaiverId ${raw.external_signed_waiver_id}`);
-
-  const runId = await createScrapeRun(raw);
-
-  await updateRawRow(raw.external_signed_waiver_id, {
-    download_status: 'queued',
-    last_error: null,
-    last_attempt_at: new Date().toISOString(),
-    ...(runId ? { last_seen_run_id: runId } : {}),
-    ...(runId && !raw.first_seen_run_id ? { first_seen_run_id: runId } : {}),
-  });
+// Browser part only: log in, find the waiver, get the PDF, close the browser.
+// Writes nothing by itself; processRow passes hooks for its own database steps.
+async function fetchWaiverPdf(raw, { mode, hooks = {} } = {}) {
+  const sampler = startMemorySampler(300);
+  const startedAt = Date.now();
 
   const browser = await chromium.launch({
     headless: HEADLESS_BOOL,
@@ -916,6 +974,7 @@ async function processRow(raw) {
   const page = await context.newPage();
 
   let timedOut = false;
+  let failed = false;
   const watchdog = setTimeout(() => {
     timedOut = true;
     console.error(`Row ${raw.external_signed_waiver_id} took longer than ${ROW_TIMEOUT_MS / 60000} minutes; closing the browser.`);
@@ -942,45 +1001,142 @@ async function processRow(raw) {
       throw new Error('No exact waiver match found in Roller results.');
     }
 
-    await updateRawRow(raw.external_signed_waiver_id, {
-      scrape_status: 'discovered',
-      ...(runId ? { last_seen_run_id: runId } : {}),
-      ...(runId && !raw.first_seen_run_id ? { first_seen_run_id: runId } : {}),
-    });
-
-    await updateScrapeRun(runId, {
-      status: 'running',
-      notes: `Strict match accepted for ${raw.external_signed_waiver_id}`,
-      total_rows_seen: 1,
-      download_success_count: 0,
-      download_failed_count: 0,
-      skipped_count: 0,
-      error_count: 0,
-      metadata: {
-        external_signed_waiver_id: raw.external_signed_waiver_id,
-        external_waiver_id: raw.external_waiver_id,
-        matched_name: candidate.nameText,
-        matched_signed_by: candidate.signedByText,
-        matched_dob: candidate.dob,
-        matched_signed_date: candidate.signedDate,
-        matched_waiver_id: candidate.waiverId,
-      },
-    });
-
     console.log('Strict match accepted.');
+    if (hooks.onMatch) await hooks.onMatch(candidate);
 
-    const { popup, pdfBuffer } = await clickRowAndCapturePdf(context, candidate, raw);
+    let pdfBuffer = null;
+    let captureInfo = null;
+
+    if (mode === 'direct') {
+      const direct = await capturePdfDirect({
+        context,
+        mainPage: page,
+        isBlocked: isBlockedRequest,
+        click: () => candidate.row.click(),
+        timeoutMs: DIRECT_CAPTURE_MS,
+      });
+      captureInfo = direct.info;
+      if (direct.pdfBuffer && hasPdfEnd(direct.pdfBuffer)) {
+        pdfBuffer = direct.pdfBuffer;
+      } else {
+        console.warn(`Direct way found no complete PDF (found: ${!!direct.pdfBuffer}); trying the viewer way.`);
+      }
+    }
+
+    if (!pdfBuffer) {
+      const viewer = await captureWithViewer(context, candidate);
+      pdfBuffer = viewer.pdfBuffer;
+      captureInfo = mode === 'direct'
+        ? { ...viewer.info, method: 'viewer (after direct found nothing)', direct: captureInfo }
+        : viewer.info;
+    }
 
     if (!pdfBuffer) {
       throw new Error('PDF response was not captured after opening the waiver.');
     }
+    if (!looksLikePdf(pdfBuffer)) {
+      throw new Error('The file from Roller is not a PDF.');
+    }
 
-    const uploadPatch = await uploadPdfToBucket(raw.external_signed_waiver_id, pdfBuffer);
+    // The browser is not needed any more; free its memory before the upload.
+    clearTimeout(watchdog);
+    await browser.close().catch(() => {});
+
+    const mem = sampler.stop();
+    return {
+      pdfBuffer,
+      captureInfo,
+      candidate,
+      peakMb: mem.peakMb,
+      memorySource: mem.source,
+      seconds: Math.round((Date.now() - startedAt) / 1000),
+    };
+  } catch (err) {
+    failed = true;
+    if (timedOut) {
+      throw new Error(`Timed out after ${ROW_TIMEOUT_MS / 60000} minutes (${err.message})`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(watchdog);
+    sampler.stop();
+    if (!failed || !KEEP_BROWSER_OPEN_ON_FAIL_BOOL || timedOut) {
+      await browser.close().catch(() => {});
+    }
+  }
+}
+
+async function processRow(raw) {
+  console.log(`Processing signedWaiverId ${raw.external_signed_waiver_id}`);
+
+  const runId = await createScrapeRun(raw);
+  const runPatch = {
+    ...(runId ? { last_seen_run_id: runId } : {}),
+    ...(runId && !raw.first_seen_run_id ? { first_seen_run_id: runId } : {}),
+  };
+
+  await updateRawRow(raw.external_signed_waiver_id, {
+    download_status: 'queued',
+    last_error: null,
+    last_attempt_at: new Date().toISOString(),
+    ...runPatch,
+  });
+
+  try {
+    const mode = await getCaptureMode();
+
+    const result = await fetchWaiverPdf(raw, {
+      mode,
+      hooks: {
+        onMatch: async (candidate) => {
+          await updateRawRow(raw.external_signed_waiver_id, {
+            scrape_status: 'discovered',
+            ...runPatch,
+          });
+
+          await updateScrapeRun(runId, {
+            status: 'running',
+            notes: `Strict match accepted for ${raw.external_signed_waiver_id}`,
+            total_rows_seen: 1,
+            download_success_count: 0,
+            download_failed_count: 0,
+            skipped_count: 0,
+            error_count: 0,
+            metadata: {
+              external_signed_waiver_id: raw.external_signed_waiver_id,
+              external_waiver_id: raw.external_waiver_id,
+              matched_name: candidate.nameText,
+              matched_signed_by: candidate.signedByText,
+              matched_dob: candidate.dob,
+              matched_signed_date: candidate.signedDate,
+              matched_waiver_id: candidate.waiverId,
+              pdf_way: mode,
+            },
+          });
+        },
+      },
+    });
+
+    await updateRawRow(raw.external_signed_waiver_id, {
+      scrape_status: 'pdf_discovered',
+    });
+
+    const uploadPatch = await uploadPdfToBucket(raw.external_signed_waiver_id, result.pdfBuffer);
     await updateRawRow(raw.external_signed_waiver_id, {
       ...uploadPatch,
-      ...(runId ? { last_seen_run_id: runId } : {}),
-      ...(runId && !raw.first_seen_run_id ? { first_seen_run_id: runId } : {}),
+      ...runPatch,
     });
+
+    const summary = {
+      way: result.captureInfo.method,
+      via: result.captureInfo.via || null,
+      kb: Math.round(result.pdfBuffer.length / 1024),
+      pages: pdfPageCount(result.pdfBuffer),
+      complete: hasPdfEnd(result.pdfBuffer),
+      peak_memory_mb: result.peakMb,
+      memory_source: result.memorySource,
+      seconds: result.seconds,
+    };
 
     await updateScrapeRun(runId, {
       status: 'completed',
@@ -996,21 +1152,16 @@ async function processRow(raw) {
         external_signed_waiver_id: raw.external_signed_waiver_id,
         external_waiver_id: raw.external_waiver_id,
         pdf_storage_path: uploadPatch.pdf_storage_path,
+        pdf: summary,
+        capture: result.captureInfo,
       },
     });
 
-    if (popup) {
-      await popup.close().catch(() => {});
-    }
-
-    console.log(`Success. PDF uploaded for ${raw.external_signed_waiver_id}.`);
+    console.log(`Success. PDF uploaded for ${raw.external_signed_waiver_id} (way ${summary.way}${summary.via ? `/${summary.via}` : ''}, ${summary.kb} KB, peak ${summary.peak_memory_mb} MB, ${summary.seconds} s).`);
   } catch (err) {
     const nextRetryCount = (raw.retry_count || 0) + 1;
     const shouldAlert = nextRetryCount >= ALERT_THRESHOLD && !raw.alert_sent;
 
-    if (timedOut) {
-      err = new Error(`Timed out after ${ROW_TIMEOUT_MS / 60000} minutes (${err.message})`);
-    }
     console.error(`Failed for ${raw.external_signed_waiver_id}:`, err.message);
 
     await updateRawRow(raw.external_signed_waiver_id, {
@@ -1020,8 +1171,7 @@ async function processRow(raw) {
       retry_count: nextRetryCount,
       next_retry_at: getNextRetryAt(nextRetryCount),
       last_attempt_at: new Date().toISOString(),
-      ...(runId ? { last_seen_run_id: runId } : {}),
-      ...(runId && !raw.first_seen_run_id ? { first_seen_run_id: runId } : {}),
+      ...runPatch,
     }).catch(() => {});
 
     await updateScrapeRun(runId, {
@@ -1058,12 +1208,117 @@ async function processRow(raw) {
     }
 
     throw err;
-  } finally {
-    clearTimeout(watchdog);
-    if (!KEEP_BROWSER_OPEN_ON_FAIL_BOOL || timedOut) {
-      await browser.close().catch(() => {});
+  }
+}
+
+// Self-test: downloads one waiver that is already saved, in each way asked for,
+// and compares it with the saved file. Writes nothing to roller_waiver_raw or
+// Storage; the result goes to the log and to one roller_scrape_runs row.
+// Started by putting "<signedWaiverId>" or "<signedWaiverId>:direct,viewer" in
+// the Supabase setting roller_worker_self_test. The worker empties the setting
+// before it starts, so a test runs once.
+async function runSelfTest(spec) {
+  const [idPart, modesPart] = String(spec).split(':');
+  const id = (idPart || '').trim();
+  const modes = (modesPart || 'direct,viewer')
+    .split(',')
+    .map((m) => m.trim().toLowerCase())
+    .filter((m) => CAPTURE_MODES.has(m));
+  const startedAt = new Date().toISOString();
+
+  console.log(`Self-test for ${id} (ways: ${modes.join(', ')}). Nothing is saved.`);
+
+  const results = [];
+  let stored = null;
+
+  const raw = /^\d+$/.test(id) ? await getRawRowBySignedWaiverId(id).catch(() => null) : null;
+  if (!raw) {
+    results.push({ ok: false, error: 'Signed waiver not found in roller_waiver_raw.' });
+  } else {
+    if (raw.pdf_storage_path) {
+      try {
+        const { data, error } = await supabase.storage
+          .from(raw.pdf_bucket_name || 'waivers')
+          .download(raw.pdf_storage_path);
+        if (!error && data) stored = Buffer.from(await data.arrayBuffer());
+      } catch {
+        stored = null;
+      }
+    }
+
+    for (const mode of modes) {
+      const t0 = Date.now();
+      try {
+        const r = await fetchWaiverPdf(raw, { mode });
+        results.push({
+          mode,
+          ok: true,
+          way: r.captureInfo.method,
+          via: r.captureInfo.via || null,
+          kb: Math.round(r.pdfBuffer.length / 1024),
+          pages: pdfPageCount(r.pdfBuffer),
+          complete: hasPdfEnd(r.pdfBuffer),
+          same_as_saved_file: stored ? md5(r.pdfBuffer) === md5(stored) : null,
+          peak_memory_mb: r.peakMb,
+          memory_source: r.memorySource,
+          seconds: r.seconds,
+          capture: r.captureInfo,
+        });
+      } catch (err) {
+        results.push({ mode, ok: false, error: err.message, seconds: Math.round((Date.now() - t0) / 1000) });
+      }
+      await sleep(3000);
     }
   }
+
+  const saved = stored
+    ? { kb: Math.round(stored.length / 1024), pages: pdfPageCount(stored), complete: hasPdfEnd(stored) }
+    : null;
+  const okCount = results.filter((r) => r.ok).length;
+
+  console.log(`Self-test result: ${JSON.stringify({ id, saved, results })}`);
+
+  try {
+    await supabase.from('roller_scrape_runs').insert({
+      source_system: 'roller',
+      trigger_type: 'manual',
+      run_scope: 'waiver_detail',
+      status: okCount === results.length ? 'completed' : okCount ? 'completed_with_errors' : 'failed',
+      runner_name: 'playwright-worker self-test',
+      started_at: startedAt,
+      finished_at: new Date().toISOString(),
+      total_rows_seen: raw ? 1 : 0,
+      download_success_count: okCount,
+      download_failed_count: results.length - okCount,
+      error_count: results.length - okCount,
+      notes: `Self-test (nothing saved) for ${id}: ${results.map((r) => `${r.mode || '?'} ${r.ok ? 'ok' : 'failed'}`).join(', ')}`,
+      metadata: { self_test: true, external_signed_waiver_id: id, saved_file: saved, results },
+    });
+  } catch (err) {
+    console.warn('Self-test result row not written:', err.message);
+  }
+}
+
+async function checkSelfTest() {
+  let spec = '';
+  try {
+    spec = await readSetting(SETTING_SELF_TEST);
+  } catch {
+    return;
+  }
+  if (!spec) return;
+
+  // Empty the setting first, so the test runs once even if the worker restarts.
+  const { error } = await supabase
+    .from('app_private_settings')
+    .update({ value: '', updated_at: new Date().toISOString() })
+    .eq('key', SETTING_SELF_TEST);
+  if (error) {
+    console.warn('Could not clear the self-test setting; skipping the test:', error.message);
+    return;
+  }
+
+  await runSelfTest(spec);
 }
 
 async function processWithRetry(raw, attempts = 3) {
@@ -1104,6 +1359,8 @@ async function getDueSpecificRow() {
 async function loopQueue() {
   while (true) {
     try {
+      await checkSelfTest();
+
       let raw = null;
 
       if (TARGET_SIGNED_WAIVER_ID) {
@@ -1146,7 +1403,7 @@ async function loopQueue() {
   }
 }
 
-console.log(`Roller PDF worker v2 started (row timeout ${ROW_TIMEOUT_MS / 60000} min, debug screenshots ${DEBUG_SCREENSHOTS_BOOL ? 'on' : 'off'}).`);
+console.log(`Roller PDF worker v3 started (PDF way from the Supabase setting ${SETTING_CAPTURE_MODE}, else ${PDF_CAPTURE_MODE}; row timeout ${ROW_TIMEOUT_MS / 60000} min; debug screenshots ${DEBUG_SCREENSHOTS_BOOL ? 'on' : 'off'}; ${memMb()}).`);
 
 loopQueue().catch((err) => {
   console.error(err);
