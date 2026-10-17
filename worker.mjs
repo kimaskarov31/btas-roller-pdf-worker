@@ -334,12 +334,20 @@ async function listCandidateRows(limit = 100) {
   return data || [];
 }
 
+// v3.1 (17 Oct 2026): a row left "queued" past STALE_QUEUE_MINUTES means the worker
+// stopped in the middle of it (usually Render killed it for using too much memory),
+// so nothing wrote the failure. Count that as a failed attempt, so a waiver that
+// keeps crashing the worker raises the same alert as one that keeps failing.
 async function claimRow(row) {
+  const crashedBefore = row.download_status === 'queued';
+  const retryCount = crashedBefore ? (row.retry_count || 0) + 1 : (row.retry_count || 0);
+
   const patch = {
     download_status: 'queued',
-    last_error: null,
+    last_error: crashedBefore ? 'Worker stopped in the middle of this waiver (probably out of memory)' : null,
     last_attempt_at: new Date().toISOString(),
     last_seen_at: new Date().toISOString(),
+    ...(crashedBefore ? { retry_count: retryCount } : {}),
   };
 
   const { data, error } = await supabase
@@ -351,7 +359,22 @@ async function claimRow(row) {
     .maybeSingle();
 
   if (error) throw error;
-  return data || null;
+  if (!data) return null;
+
+  if (crashedBefore) {
+    console.log(`Taking ${data.external_signed_waiver_id} again: the worker stopped during it before (attempt count ${retryCount}).`);
+    if (retryCount >= ALERT_THRESHOLD && !data.alert_sent) {
+      try {
+        await createFailureAlert(data, new Error(patch.last_error), retryCount);
+        await updateRawRow(data.external_signed_waiver_id, { alert_sent: true });
+        data.alert_sent = true;
+      } catch (alertErr) {
+        console.error('Could not save the crash alert:', alertErr.message);
+      }
+    }
+  }
+
+  return data;
 }
 
 async function claimNextDueRow() {
